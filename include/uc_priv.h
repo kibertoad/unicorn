@@ -275,6 +275,10 @@ static inline bool _hook_exists_bounded(struct list_item *cur, uint64_t addr)
 typedef struct TargetPageBits TargetPageBits;
 typedef struct TCGContext TCGContext;
 
+// size_recur_prot_page when no page has had its *_PROT hook accept the access
+// that is being split up
+#define UC_NO_PROT_PAGE ((uint64_t)-1)
+
 struct uc_struct {
     uc_arch arch;
     uc_mode mode;
@@ -379,8 +383,8 @@ struct uc_struct {
     size_t emu_count;   // save counter of uc_emu_start()
 
     int size_recur_mem; // size for mem access when in a recursive call
-    uint64_t size_recur_prot_page; // page a *_PROT hook already accepted for
-                                   // the access split up by the recursion
+    uint64_t size_recur_prot_page; // guest page a *_PROT hook already accepted
+                                   // for the access split up by the recursion
 
     bool init_tcg;       // already initialized local TCGv variables?
     bool stop_request;   // request to immediately stop emulation - for

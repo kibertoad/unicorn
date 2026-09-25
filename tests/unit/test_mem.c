@@ -701,6 +701,8 @@ typedef struct {
     // When true, the callback unmaps the page
     bool unmap;
     bool ret;
+    // When non-zero, the callback returns false for addresses from here on
+    uint64_t deny_from;
 } mem_prot_hook_ctx;
 
 static bool test_mem_prot_hook_cb(uc_engine *uc, uc_mem_type type,
@@ -718,6 +720,9 @@ static bool test_mem_prot_hook_cb(uc_engine *uc, uc_mem_type type,
         OK(uc_mem_unmap(uc, address & ~0xfffULL, 0x1000));
     } else if (ctx->new_perms) {
         OK(uc_mem_protect(uc, address & ~0xfffULL, 0x1000, ctx->new_perms));
+    }
+    if (ctx->deny_from && address >= ctx->deny_from) {
+        return false;
     }
     return ctx->ret;
 }
@@ -1176,6 +1181,149 @@ static void test_mem_write_prot_hook_snapshot(void)
     OK(uc_close(uc));
 }
 
+// UC_HOOK_MEM_READ and UC_HOOK_MEM_WRITE callback that changes the
+// permissions of the page, splitting the region it sits in
+static void test_mem_access_protect_cb(uc_engine *uc, uc_mem_type type,
+                                       uint64_t address, int size,
+                                       int64_t value, void *user_data)
+{
+    mem_prot_hook_ctx *ctx = (mem_prot_hook_ctx *)user_data;
+
+    ctx->count++;
+    OK(uc_mem_protect(uc, address & ~0xfffULL, 0x1000, ctx->new_perms));
+}
+
+// A UC_HOOK_MEM_WRITE callback that makes the page writable lets the store
+// through.
+static void test_mem_write_hook_grant(void)
+{
+    uc_engine *uc;
+    uc_hook hook;
+    mem_prot_hook_ctx ctx = {0};
+    uint32_t value = 0;
+
+    ctx.new_perms = UC_PROT_READ | UC_PROT_WRITE;
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, PROT_CODE_ADDR, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc, PROT_DATA_ADDR, 0x2000, UC_PROT_READ));
+    OK(uc_mem_write(uc, PROT_CODE_ADDR, prot_write_code,
+                    sizeof(prot_write_code) - 1));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_WRITE, test_mem_access_protect_cb,
+                   &ctx, 1, 0));
+    OK(uc_emu_start(uc, PROT_CODE_ADDR,
+                    PROT_CODE_ADDR + sizeof(prot_write_code) - 1, 0, 0));
+    TEST_CHECK(ctx.count == 1);
+
+    OK(uc_mem_read(uc, PROT_DATA_ADDR, &value, sizeof(value)));
+    TEST_CHECK(value == 0x12345678);
+
+    OK(uc_close(uc));
+}
+
+// A UC_HOOK_MEM_READ callback that makes the page unreadable stops the load.
+// The page sits in the middle of a larger region, so the region is split up.
+static void test_mem_read_hook_revoke(void)
+{
+    uc_engine *uc;
+    uc_hook hook;
+    mem_prot_hook_ctx ctx = {0};
+    uint32_t eax = 0;
+    // mov eax, [0x3000]
+    const char code[] = "\xa1\x00\x30\x00\x00";
+
+    ctx.new_perms = UC_PROT_NONE;
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, PROT_CODE_ADDR, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc, PROT_DATA_ADDR, 0x3000, UC_PROT_READ));
+    OK(uc_mem_write(uc, PROT_CODE_ADDR, code, sizeof(code) - 1));
+    OK(uc_mem_write(uc, PROT_PAGE2_ADDR, prot_data, sizeof(prot_data) - 1));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ, test_mem_access_protect_cb,
+                   &ctx, 1, 0));
+    uc_assert_err(UC_ERR_READ_PROT,
+                  uc_emu_start(uc, PROT_CODE_ADDR,
+                               PROT_CODE_ADDR + sizeof(code) - 1, 0, 0));
+    TEST_CHECK(ctx.count == 1);
+
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0);
+
+    OK(uc_close(uc));
+}
+
+// Code on a non-executable page runs after a UC_HOOK_MEM_FETCH_PROT callback
+// accepts the fetch. A store into it accepted by a UC_HOOK_MEM_WRITE_PROT
+// callback must drop that translation.
+static void test_mem_write_prot_hook_smc_no_exec(void)
+{
+    uc_engine *uc;
+    uc_hook hook;
+    mem_prot_hook_ctx ctx = {0};
+    uint32_t eax = 0;
+    uint32_t esp = PROT_PAGE2_ADDR + 0x1000;
+
+    const char code[] = "\xe8\xfb\x0f\x00\x00"         // 00: call 0x2000
+                        "\xc6\x05\x00\x20\x00\x00\x48" // 05: mov [0x2000], 0x48
+                        "\xe8\xef\x0f\x00\x00";        // 0c: call 0x2000
+    // inc eax; ret
+    const char target[] = "\x40\xc3";
+
+    ctx.ret = true;
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, PROT_CODE_ADDR, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc, PROT_DATA_ADDR, 0x1000, UC_PROT_READ));
+    OK(uc_mem_map(uc, PROT_PAGE2_ADDR, 0x1000, UC_PROT_READ | UC_PROT_WRITE));
+    OK(uc_mem_write(uc, PROT_CODE_ADDR, code, sizeof(code) - 1));
+    OK(uc_mem_write(uc, PROT_DATA_ADDR, target, sizeof(target) - 1));
+    OK(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_FETCH_PROT | UC_HOOK_MEM_WRITE_PROT,
+                   test_mem_prot_hook_cb, &ctx, 1, 0));
+    OK(uc_emu_start(uc, PROT_CODE_ADDR, PROT_CODE_ADDR + sizeof(code) - 1, 0,
+                    0));
+
+    // The store turns "inc eax" into "dec eax", so the second call undoes the
+    // first one only if the stale translation was dropped.
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0);
+
+    OK(uc_close(uc));
+}
+
+// An accepted unaligned store into the running block restarts the
+// instruction partway through the split store. The page must not stay
+// accepted afterwards, so a later store the hook denies still fails.
+static void test_mem_write_prot_hook_unaligned_smc(void)
+{
+    uc_engine *uc;
+    uc_hook hook;
+    mem_prot_hook_ctx ctx = {0};
+    uint32_t eax = 0;
+    uint8_t byte = 0xff;
+
+    const char code[] =
+        "\xc7\x05\x11\x10\x00\x00\x90\x90\x90\x90" // 00: mov dword [0x1011], nops
+        "\x90\x90\x90\x90\x90\x90\x90"             // 0a: nop x7
+        "\x40\x40\x40\x40"                         // 11: inc eax x4
+        "\xc6\x05\x30\x10\x00\x00\x01";            // 15: mov byte [0x1030], 1
+
+    ctx.ret = true;
+    ctx.deny_from = PROT_CODE_ADDR + 0x20;
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, PROT_CODE_ADDR, 0x1000, UC_PROT_READ | UC_PROT_EXEC));
+    OK(uc_mem_write(uc, PROT_CODE_ADDR, code, sizeof(code) - 1));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_WRITE_PROT, test_mem_prot_hook_cb,
+                   &ctx, 1, 0));
+    uc_assert_err(UC_ERR_WRITE_PROT,
+                  uc_emu_start(uc, PROT_CODE_ADDR,
+                               PROT_CODE_ADDR + sizeof(code) - 1, 0, 0));
+
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0);
+    OK(uc_mem_read(uc, PROT_CODE_ADDR + 0x30, &byte, 1));
+    TEST_CHECK(byte == 0);
+
+    OK(uc_close(uc));
+}
+
 TEST_LIST = {{"test_map_correct", test_map_correct},
              {"test_map_wrapping", test_map_wrapping},
              {"test_mem_protect", test_mem_protect},
@@ -1226,4 +1374,10 @@ TEST_LIST = {{"test_map_correct", test_map_correct},
               test_mem_read_prot_cross_page_no_hook},
              {"test_mem_write_prot_hook_snapshot",
               test_mem_write_prot_hook_snapshot},
+             {"test_mem_write_hook_grant", test_mem_write_hook_grant},
+             {"test_mem_read_hook_revoke", test_mem_read_hook_revoke},
+             {"test_mem_write_prot_hook_smc_no_exec",
+              test_mem_write_prot_hook_smc_no_exec},
+             {"test_mem_write_prot_hook_unaligned_smc",
+              test_mem_write_prot_hook_unaligned_smc},
              {NULL, NULL}};

@@ -471,21 +471,28 @@ typedef void (*uc_cb_hookmem_t)(uc_engine *uc, uc_mem_type type,
   only work if the accessed memory is mapped during the hook.
 
            In the event of a UC_MEM_READ_PROT, UC_MEM_WRITE_PROT or
-  UC_MEM_FETCH_PROT callback, returning true performs the access once, whether
+  UC_MEM_FETCH_PROT callback, returning true lets that access go ahead, whether
   or not the hook changed the permissions of the page. Use uc_mem_protect() in
   the hook to stop further accesses from triggering the hook again. If the hook
   unmaps the page, emulation stops with UC_ERR_MAP. An access that the engine
   splits up (for example an unaligned access or one that crosses a page
-  boundary) calls the hook at most once for each page it touches.
+  boundary) calls the hook at most once for each page it touches. If the
+  engine restarts the instruction, the hook is called again for the repeated
+  access, as UC_HOOK_MEM_READ and UC_HOOK_MEM_WRITE hooks are. One case is a
+  store that changes code of the translated block that is running.
 
            Returning true from a UC_MEM_WRITE_PROT callback writes the data
   into the read-only page. Older versions dropped the write instead, so a hook
   that returned true to ignore writes to ROM now lets them change the ROM.
 
-           For UC_MEM_FETCH_PROT, the code translated after the hook returned
-  true is cached. Running the same code again uses the cached translation, so
-  the hook is not called again even if the page is still not executable. Call
-  uc_ctl_remove_cache() on the page to drop the translation.
+           For UC_MEM_FETCH_PROT, the translator reads code in small pieces
+  (often one byte at a time on x86), and each read is a separate access that
+  calls the hook, so one instruction can call it several times. The code
+  translated after the hook returned true is cached. Running the same code again uses the
+  cached translation, so the hook is not called again even if the page is
+  still not executable. Writes to a writable page without UC_PROT_EXEC do not
+  drop that translation, so call uc_ctl_remove_cache() on the page after
+  changing code there.
 
            In the event of a UC_MEM_READ_UNMAPPED or UC_MEM_WRITE_UNMAPPED
   callback, the memory should be uc_mem_map()-ed with the correct permissions,

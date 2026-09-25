@@ -94,6 +94,7 @@ static int tcg_cpu_exec(struct uc_struct *uc)
         if (cpu_can_run(cpu)) {
             uc->quit_request = false;
             uc->size_recur_mem = 0;
+            uc->size_recur_prot_page = UC_NO_PROT_PAGE;
             r = cpu_exec(uc, cpu);
 
             // quit current TB but continue emulating?
