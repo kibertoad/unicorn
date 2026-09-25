@@ -1535,6 +1535,39 @@ static inline void tlb_hook_state_restore(CPUArchState *env,
 #endif
 }
 
+/*
+ * Unicorn: a hook that returned true may have changed mappings or
+ * permissions, which flushes (and may resize) the TLB. The entry pointer and
+ * tlb_addr read before the hook ran can then be stale, so look the page up
+ * again and refill it on a miss.
+ */
+static inline target_ulong tlb_reload_after_hook(CPUArchState *env,
+                                                 target_ulong addr, int size,
+                                                 MMUAccessType access_type,
+                                                 int mmu_idx, uintptr_t retaddr,
+                                                 size_t tlb_off,
+                                                 uintptr_t *index,
+                                                 CPUTLBEntry **entry)
+{
+    struct uc_struct *uc = env->uc;
+    target_ulong tlb_addr;
+
+    *index = tlb_index(env, mmu_idx, addr);
+    *entry = tlb_entry(env, mmu_idx, addr);
+    tlb_addr = tlb_read_ofs(*entry, tlb_off);
+    if (!tlb_hit(uc, tlb_addr, addr)) {
+        if (!victim_tlb_hit(env, mmu_idx, *index, tlb_off,
+                            addr & TARGET_PAGE_MASK)) {
+            tlb_fill(env_cpu(env), addr, size,
+                     access_type, mmu_idx, retaddr);
+            *index = tlb_index(env, mmu_idx, addr);
+            *entry = tlb_entry(env, mmu_idx, addr);
+        }
+        tlb_addr = tlb_read_ofs(*entry, tlb_off) & ~TLB_INVALID_MASK;
+    }
+    return tlb_addr;
+}
+
 static inline uint64_t
 load_memop(const void *haddr, MemOp op)
 {
@@ -1748,18 +1781,23 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
             }
 
             if (handled) {
+                // The hook accepted the read: go ahead with it even if the
+                // page is still not readable, unless the page is now gone.
                 uc->invalid_error = UC_ERR_OK;
-                /* If the TLB entry is for a different page, reload and try again.  */
-                if (!tlb_hit(env->uc, tlb_addr, addr)) {
-                    if (!victim_tlb_hit(env, mmu_idx, index, tlb_off,
-                                        addr & TARGET_PAGE_MASK)) {
-                        tlb_fill(env_cpu(env), addr, size,
-                                 access_type, mmu_idx, retaddr);
-                        index = tlb_index(env, mmu_idx, addr);
-                        entry = tlb_entry(env, mmu_idx, addr);
+                tlb_addr = tlb_reload_after_hook(env, addr, size, access_type,
+                                                 mmu_idx, retaddr, tlb_off,
+                                                 &index, &entry);
+                paddr = entry->paddr | (addr & ~TARGET_PAGE_MASK);
+                mr = uc->memory_mapping(uc, paddr);
+                if (mr == NULL) {
+                    uc->invalid_addr = paddr;
+                    uc->invalid_error = UC_ERR_MAP;
+                    if (uc->nested_level > 0 && !uc->cpu->stopped) {
+                        cpu_exit(uc->cpu);
+                        // See comments above
+                        cpu_loop_exit_restore(uc->cpu, retaddr);
                     }
-                    tlb_addr = code_read ? entry->addr_code : entry->addr_read;
-                    tlb_addr &= ~TLB_INVALID_MASK;
+                    return 0;
                 }
                 tlb_hook_state_restore(env, &hook_state);
             } else {
@@ -1796,7 +1834,24 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
             }
 
             if (handled) {
+                // The hook accepted the fetch: go ahead with it even if the
+                // page is still not executable, unless the page is now gone.
                 uc->invalid_error = UC_ERR_OK;
+                tlb_addr = tlb_reload_after_hook(env, addr, size, access_type,
+                                                 mmu_idx, retaddr, tlb_off,
+                                                 &index, &entry);
+                paddr = entry->paddr | (addr & ~TARGET_PAGE_MASK);
+                mr = uc->memory_mapping(uc, paddr);
+                if (mr == NULL) {
+                    uc->invalid_addr = paddr;
+                    uc->invalid_error = UC_ERR_MAP;
+                    if (uc->nested_level > 0 && !uc->cpu->stopped) {
+                        cpu_exit(uc->cpu);
+                        // See comments above
+                        cpu_loop_exit_restore(uc->cpu, retaddr);
+                    }
+                    return 0;
+                }
                 tlb_hook_state_restore(env, &hook_state);
             } else {
                 uc->invalid_addr = paddr;
@@ -2210,6 +2265,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
     size_t size = memop_size(op);
     struct hook *hook;
     bool handled;
+    bool force_write = false;
     MemoryRegion *mr;
     CPUTLBHookState hook_state;
 
@@ -2324,18 +2380,22 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
         }
 
         if (handled) {
-            /* If the TLB entry is for a different page, reload and try again.  */
-            if (!tlb_hit(env->uc, tlb_addr, addr)) {
-                if (!victim_tlb_hit(env, mmu_idx, index, tlb_off,
-                    addr & TARGET_PAGE_MASK)) {
-                    tlb_fill(env_cpu(env), addr, size, MMU_DATA_STORE,
-                             mmu_idx, retaddr);
-                    index = tlb_index(env, mmu_idx, addr);
-                    entry = tlb_entry(env, mmu_idx, addr);
-                }
-                tlb_addr = tlb_addr_write(entry) & ~TLB_INVALID_MASK;
-            }
             uc->invalid_error = UC_ERR_OK;
+            tlb_addr = tlb_reload_after_hook(env, addr, size, MMU_DATA_STORE,
+                                             mmu_idx, retaddr, tlb_off,
+                                             &index, &entry);
+            paddr = entry->paddr | (addr & ~TARGET_PAGE_MASK);
+            mr = uc->memory_mapping(uc, paddr);
+            if (mr == NULL) {
+                uc->invalid_addr = paddr;
+                uc->invalid_error = UC_ERR_MAP;
+                cpu_exit(uc->cpu);
+                return;
+            }
+            // The hook accepted the write. If it left the page read-only,
+            // the TLB entry still has TLB_DISCARD_WRITE, so remember to
+            // store through it anyway.
+            force_write = !(mr->perms & UC_PROT_WRITE);
             tlb_hook_state_restore(env, &hook_state);
         } else {
             uc->invalid_addr = paddr;
@@ -2392,7 +2452,14 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
 
         /* Ignore writes to ROM.  */
         if (unlikely(tlb_addr & TLB_DISCARD_WRITE)) {
-            return;
+            if (!force_write) {
+                return;
+            }
+            // Unicorn: a UC_HOOK_MEM_WRITE_PROT callback accepted this
+            // store. Read-only pages never get TLB_NOTDIRTY, so drop any
+            // translations of this page here.
+            notdirty_write(env_cpu(env), addr, size, iotlbentry, retaddr,
+                           entry);
         }
 
         /* Handle clean RAM pages.  */
