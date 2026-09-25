@@ -700,6 +700,8 @@ typedef struct {
     uint32_t new_perms;
     // When true, the callback unmaps the page
     bool unmap;
+    // When true, the callback maps the page with UC_PROT_ALL
+    bool map;
     bool ret;
 } mem_prot_hook_ctx;
 
@@ -716,6 +718,8 @@ static bool test_mem_prot_hook_cb(uc_engine *uc, uc_mem_type type,
     }
     if (ctx->unmap) {
         OK(uc_mem_unmap(uc, address & ~0xfffULL, 0x1000));
+    } else if (ctx->map) {
+        OK(uc_mem_map(uc, address & ~0xfffULL, 0x1000, UC_PROT_ALL));
     } else if (ctx->new_perms) {
         OK(uc_mem_protect(uc, address & ~0xfffULL, 0x1000, ctx->new_perms));
     }
@@ -1176,6 +1180,103 @@ static void test_mem_write_prot_hook_snapshot(void)
     OK(uc_close(uc));
 }
 
+/*
+ * UC_HOOK_MEM_*_UNMAPPED callbacks. Only the code page is mapped, so the
+ * access to PROT_DATA_ADDR is unmapped. If the hook returns true without
+ * mapping the page, emulation stops with UC_ERR_MAP and UC_CTL_INVALID_ADDR
+ * reports the address.
+ */
+static uc_err test_mem_unmapped_run(uc_engine **uc, const char *code,
+                                    size_t code_len, int hook_type,
+                                    mem_prot_hook_ctx *ctx)
+{
+    uc_hook hook;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, uc));
+    OK(uc_mem_map(*uc, PROT_CODE_ADDR, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(*uc, PROT_CODE_ADDR, code, code_len));
+    OK(uc_hook_add(*uc, &hook, hook_type, test_mem_prot_hook_cb, ctx, 1, 0));
+    return uc_emu_start(*uc, PROT_CODE_ADDR, PROT_CODE_ADDR + code_len, 0, 0);
+}
+
+static void test_mem_unmapped_hook_no_map(const char *code, size_t code_len,
+                                          int hook_type, uc_mem_type type)
+{
+    uc_engine *uc;
+    mem_prot_hook_ctx ctx = {0};
+    uint64_t invalid_addr = 0;
+
+    ctx.ret = true;
+    uc_assert_err(UC_ERR_MAP,
+                  test_mem_unmapped_run(&uc, code, code_len, hook_type, &ctx));
+    TEST_CHECK(ctx.count == 1);
+    TEST_CHECK(ctx.type == type);
+    TEST_CHECK(ctx.address == PROT_DATA_ADDR);
+
+    OK(uc_ctl_get_invalid_addr(uc, &invalid_addr));
+    TEST_CHECK(invalid_addr == PROT_DATA_ADDR);
+
+    OK(uc_close(uc));
+}
+
+static void test_mem_read_unmapped_hook_no_map(void)
+{
+    test_mem_unmapped_hook_no_map(prot_read_code, sizeof(prot_read_code) - 1,
+                                  UC_HOOK_MEM_READ_UNMAPPED,
+                                  UC_MEM_READ_UNMAPPED);
+}
+
+static void test_mem_write_unmapped_hook_no_map(void)
+{
+    test_mem_unmapped_hook_no_map(prot_write_code, sizeof(prot_write_code) - 1,
+                                  UC_HOOK_MEM_WRITE_UNMAPPED,
+                                  UC_MEM_WRITE_UNMAPPED);
+}
+
+static void test_mem_fetch_unmapped_hook_no_map(void)
+{
+    test_mem_unmapped_hook_no_map(prot_fetch_code, sizeof(prot_fetch_code) - 1,
+                                  UC_HOOK_MEM_FETCH_UNMAPPED,
+                                  UC_MEM_FETCH_UNMAPPED);
+}
+
+// A hook that maps the page lets the access go ahead.
+static void test_mem_read_unmapped_hook_map(void)
+{
+    uc_engine *uc;
+    mem_prot_hook_ctx ctx = {0};
+    uint32_t eax = 0xffffffff;
+
+    ctx.map = true;
+    ctx.ret = true;
+    OK(test_mem_unmapped_run(&uc, prot_read_code, sizeof(prot_read_code) - 1,
+                             UC_HOOK_MEM_READ_UNMAPPED, &ctx));
+    TEST_CHECK(ctx.count == 1);
+
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0);
+
+    OK(uc_close(uc));
+}
+
+static void test_mem_write_unmapped_hook_map(void)
+{
+    uc_engine *uc;
+    mem_prot_hook_ctx ctx = {0};
+    uint32_t value = 0;
+
+    ctx.map = true;
+    ctx.ret = true;
+    OK(test_mem_unmapped_run(&uc, prot_write_code, sizeof(prot_write_code) - 1,
+                             UC_HOOK_MEM_WRITE_UNMAPPED, &ctx));
+    TEST_CHECK(ctx.count == 1);
+
+    OK(uc_mem_read(uc, PROT_DATA_ADDR, &value, sizeof(value)));
+    TEST_CHECK(value == 0x12345678);
+
+    OK(uc_close(uc));
+}
+
 TEST_LIST = {{"test_map_correct", test_map_correct},
              {"test_map_wrapping", test_map_wrapping},
              {"test_mem_protect", test_mem_protect},
@@ -1226,4 +1327,14 @@ TEST_LIST = {{"test_map_correct", test_map_correct},
               test_mem_read_prot_cross_page_no_hook},
              {"test_mem_write_prot_hook_snapshot",
               test_mem_write_prot_hook_snapshot},
+             {"test_mem_read_unmapped_hook_no_map",
+              test_mem_read_unmapped_hook_no_map},
+             {"test_mem_write_unmapped_hook_no_map",
+              test_mem_write_unmapped_hook_no_map},
+             {"test_mem_fetch_unmapped_hook_no_map",
+              test_mem_fetch_unmapped_hook_no_map},
+             {"test_mem_read_unmapped_hook_map",
+              test_mem_read_unmapped_hook_map},
+             {"test_mem_write_unmapped_hook_map",
+              test_mem_write_unmapped_hook_map},
              {NULL, NULL}};
