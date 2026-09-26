@@ -1,5 +1,9 @@
 #include "unicorn_test.h"
 
+#if !(defined(_WIN32) || defined(__WIN32__) || defined(__WINDOWS__))
+#include <sys/mman.h>
+#endif
+
 static void test_map_correct(void)
 {
     uc_engine *uc;
@@ -696,6 +700,8 @@ typedef struct {
     int count;
     uc_mem_type type;
     uint64_t address;
+    int size;
+    int64_t value;
     // When non-zero, the callback applies these permissions to the page
     uint32_t new_perms;
     // When true, the callback unmaps the page
@@ -715,6 +721,8 @@ static bool test_mem_prot_hook_cb(uc_engine *uc, uc_mem_type type,
     if (ctx->count++ == 0) {
         ctx->type = type;
         ctx->address = address;
+        ctx->size = size;
+        ctx->value = value;
     }
     if (ctx->unmap) {
         OK(uc_mem_unmap(uc, address & ~0xfffULL, 0x1000));
@@ -829,7 +837,8 @@ static void test_mem_fetch_prot_hook(uint32_t new_perms, bool ret,
                       sizeof(prot_fetch_target) - 1,
                       PROT_DATA_ADDR + sizeof(prot_fetch_target) - 1,
                       UC_HOOK_MEM_FETCH_PROT, &ctx));
-    TEST_CHECK(ctx.count >= 1);
+    // Once the hook made the page executable, later fetches do not call it
+    TEST_CHECK(new_perms & UC_PROT_EXEC ? ctx.count == 1 : ctx.count >= 1);
     TEST_CHECK(ctx.type == UC_MEM_FETCH_PROT);
     TEST_CHECK(ctx.address == PROT_DATA_ADDR);
 
@@ -1080,7 +1089,9 @@ static void test_mem_read_prot_hook_cross_page(bool ret, uc_err expected_err)
                       UC_HOOK_MEM_READ_PROT, &ctx));
     TEST_CHECK(ctx.count == 1);
     TEST_CHECK(ctx.type == UC_MEM_READ_PROT);
+    // The hook covers the 2 bytes the load reads on the second page
     TEST_CHECK(ctx.address == PROT_PAGE2_ADDR);
+    TEST_CHECK(ctx.size == 2);
 
     OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
     TEST_CHECK(eax == (expected_err == UC_ERR_OK ? 0x12345678 : 0));
@@ -1102,12 +1113,15 @@ static void test_mem_write_prot_hook_cross_page(bool ret, uc_err expected_err)
                       UC_HOOK_MEM_WRITE_PROT, &ctx));
     TEST_CHECK(ctx.count == 1);
     TEST_CHECK(ctx.type == UC_MEM_WRITE_PROT);
+    // The hook covers the 2 bytes the store writes on the second page
     TEST_CHECK(ctx.address == PROT_PAGE2_ADDR);
+    TEST_CHECK(ctx.size == 2);
+    TEST_CHECK(ctx.value == 0x8765);
 
-    if (expected_err == UC_ERR_OK) {
-        OK(uc_mem_read(uc, PROT_PAGE2_ADDR - 2, &value, sizeof(value)));
-        TEST_CHECK(value == 0x87654321);
-    }
+    // A denied store leaves the first page alone too
+    OK(uc_mem_read(uc, PROT_PAGE2_ADDR - 2, &value, sizeof(value)));
+    TEST_CHECK(value ==
+               (expected_err == UC_ERR_OK ? 0x87654321 : 0x12345678));
 
     OK(uc_close(uc));
 }
@@ -1324,6 +1338,265 @@ static void test_mem_write_prot_hook_unaligned_smc(void)
     OK(uc_close(uc));
 }
 
+// A page mapped with uc_mem_map_ptr() is host memory, and the host may have
+// mapped it read-only. A store that a UC_HOOK_MEM_WRITE_PROT callback accepted
+// without making the page writable is dropped there, for whole and split
+// stores, instead of crashing the process. uc_mem_protect() makes the page
+// read-only, which sends stores to it through the slow path.
+static void test_mem_write_prot_hook_map_ptr(void)
+{
+    uc_engine *uc;
+    uc_hook hook;
+    mem_prot_hook_ctx ctx = {0};
+    uint8_t *host;
+    uint32_t value = 0;
+    const char code[] =
+        "\xc7\x05\x00\x20\x00\x00\x21\x43\x65\x87"  // mov dword [0x2000], ...
+        "\xc7\x05\x01\x20\x00\x00\x21\x43\x65\x87"; // mov dword [0x2001], ...
+
+#if defined(_WIN32) || defined(__WIN32__) || defined(__WINDOWS__)
+    DWORD old_protect;
+
+    host = VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE,
+                        PAGE_READWRITE);
+    TEST_CHECK(host != NULL);
+    memcpy(host, prot_data, sizeof(prot_data) - 1);
+    TEST_CHECK(VirtualProtect(host, 0x1000, PAGE_READONLY, &old_protect));
+#else
+    host = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    TEST_CHECK(host != MAP_FAILED);
+    memcpy(host, prot_data, sizeof(prot_data) - 1);
+    TEST_CHECK(mprotect(host, 0x1000, PROT_READ) == 0);
+#endif
+
+    ctx.ret = true;
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, PROT_CODE_ADDR, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map_ptr(uc, PROT_DATA_ADDR, 0x1000, UC_PROT_ALL, host));
+    OK(uc_mem_protect(uc, PROT_DATA_ADDR, 0x1000, UC_PROT_READ));
+    OK(uc_mem_write(uc, PROT_CODE_ADDR, code, sizeof(code) - 1));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_WRITE_PROT, test_mem_prot_hook_cb,
+                   &ctx, 1, 0));
+    OK(uc_emu_start(uc, PROT_CODE_ADDR, PROT_CODE_ADDR + sizeof(code) - 1, 0,
+                    0));
+    TEST_CHECK(ctx.count == 2);
+
+    OK(uc_mem_read(uc, PROT_DATA_ADDR, &value, sizeof(value)));
+    TEST_CHECK(value == 0x12345678);
+
+    OK(uc_close(uc));
+
+#if defined(_WIN32) || defined(__WIN32__) || defined(__WINDOWS__)
+    VirtualFree(host, 0, MEM_RELEASE);
+#else
+    munmap(host, 0x1000);
+#endif
+}
+
+// UC_HOOK_MEM_*_UNMAPPED callback that maps the page as read-write, fills it
+// with prot_data and returns true
+static bool test_mem_map_on_fault_cb(uc_engine *uc, uc_mem_type type,
+                                     uint64_t address, int size, int64_t value,
+                                     void *user_data)
+{
+    mem_prot_hook_ctx *ctx = (mem_prot_hook_ctx *)user_data;
+
+    if (ctx->count++ == 0) {
+        ctx->type = type;
+        ctx->address = address;
+        ctx->size = size;
+        ctx->value = value;
+    }
+    OK(uc_mem_map(uc, address & ~0xfffULL, 0x1000,
+                  UC_PROT_READ | UC_PROT_WRITE));
+    OK(uc_mem_write(uc, address & ~0xfffULL, prot_data, sizeof(prot_data) - 1));
+    return true;
+}
+
+// Without a hook, a store that crosses into an unmapped page fails before it
+// writes anything to the first page.
+static void test_mem_write_cross_page_unmapped(void)
+{
+    uc_engine *uc;
+    uint16_t value = 0;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, PROT_CODE_ADDR, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc, PROT_DATA_ADDR, 0x1000, UC_PROT_READ | UC_PROT_WRITE));
+    OK(uc_mem_write(uc, PROT_CODE_ADDR, prot_write_cross_code,
+                    sizeof(prot_write_cross_code) - 1));
+    OK(uc_mem_write(uc, PROT_PAGE2_ADDR - 2, "\x78\x56", 2));
+    uc_assert_err(UC_ERR_WRITE_UNMAPPED,
+                  uc_emu_start(uc, PROT_CODE_ADDR,
+                               PROT_CODE_ADDR +
+                                   sizeof(prot_write_cross_code) - 1,
+                               0, 0));
+
+    OK(uc_mem_read(uc, PROT_PAGE2_ADDR - 2, &value, sizeof(value)));
+    TEST_CHECK(value == 0x5678);
+
+    OK(uc_close(uc));
+}
+
+// A UC_HOOK_MEM_WRITE_UNMAPPED callback for the second page of a split store
+// gets the part of the store on that page, and can map the page to let the
+// whole store through.
+static void test_mem_write_unmapped_hook_cross_page(void)
+{
+    uc_engine *uc;
+    uc_hook hook;
+    mem_prot_hook_ctx ctx = {0};
+    uint32_t value = 0;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, PROT_CODE_ADDR, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc, PROT_DATA_ADDR, 0x1000, UC_PROT_READ | UC_PROT_WRITE));
+    OK(uc_mem_write(uc, PROT_CODE_ADDR, prot_write_cross_code,
+                    sizeof(prot_write_cross_code) - 1));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_WRITE_UNMAPPED,
+                   test_mem_map_on_fault_cb, &ctx, 1, 0));
+    OK(uc_emu_start(uc, PROT_CODE_ADDR,
+                    PROT_CODE_ADDR + sizeof(prot_write_cross_code) - 1, 0, 0));
+    TEST_CHECK(ctx.count == 1);
+    TEST_CHECK(ctx.type == UC_MEM_WRITE_UNMAPPED);
+    TEST_CHECK(ctx.address == PROT_PAGE2_ADDR);
+    TEST_CHECK(ctx.size == 2);
+    TEST_CHECK(ctx.value == 0x8765);
+
+    OK(uc_mem_read(uc, PROT_PAGE2_ADDR - 2, &value, sizeof(value)));
+    TEST_CHECK(value == 0x87654321);
+
+    OK(uc_close(uc));
+}
+
+// A UC_HOOK_MEM_READ_UNMAPPED callback for the second page of a split load
+// gets the part of the load on that page.
+static void test_mem_read_unmapped_hook_cross_page(void)
+{
+    uc_engine *uc;
+    uc_hook hook;
+    mem_prot_hook_ctx ctx = {0};
+    uint32_t eax = 0;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, PROT_CODE_ADDR, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc, PROT_DATA_ADDR, 0x1000, UC_PROT_READ | UC_PROT_WRITE));
+    OK(uc_mem_write(uc, PROT_CODE_ADDR, prot_read_cross_code,
+                    sizeof(prot_read_cross_code) - 1));
+    OK(uc_mem_write(uc, PROT_PAGE2_ADDR - 2, "\x78\x56", 2));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ_UNMAPPED,
+                   test_mem_map_on_fault_cb, &ctx, 1, 0));
+    OK(uc_emu_start(uc, PROT_CODE_ADDR,
+                    PROT_CODE_ADDR + sizeof(prot_read_cross_code) - 1, 0, 0));
+    TEST_CHECK(ctx.count == 1);
+    TEST_CHECK(ctx.type == UC_MEM_READ_UNMAPPED);
+    TEST_CHECK(ctx.address == PROT_PAGE2_ADDR);
+    TEST_CHECK(ctx.size == 2);
+
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0x56785678);
+
+    OK(uc_close(uc));
+}
+
+// UC_HOOK_MEM_READ and UC_HOOK_MEM_WRITE callback that unmaps the page
+static void test_mem_access_unmap_cb(uc_engine *uc, uc_mem_type type,
+                                     uint64_t address, int size, int64_t value,
+                                     void *user_data)
+{
+    OK(uc_mem_unmap(uc, address & ~0xfffULL, 0x1000));
+}
+
+// A page that a UC_HOOK_MEM_WRITE callback unmaps goes to the
+// UC_HOOK_MEM_WRITE_UNMAPPED hooks, which can map it again.
+static void test_mem_write_hook_unmap(void)
+{
+    uc_engine *uc;
+    uc_hook hook1, hook2;
+    mem_prot_hook_ctx ctx = {0};
+    uint32_t value = 0;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, PROT_CODE_ADDR, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc, PROT_DATA_ADDR, 0x1000, UC_PROT_READ | UC_PROT_WRITE));
+    OK(uc_mem_write(uc, PROT_CODE_ADDR, prot_write_code,
+                    sizeof(prot_write_code) - 1));
+    OK(uc_hook_add(uc, &hook1, UC_HOOK_MEM_WRITE, test_mem_access_unmap_cb,
+                   NULL, 1, 0));
+    OK(uc_hook_add(uc, &hook2, UC_HOOK_MEM_WRITE_UNMAPPED,
+                   test_mem_map_on_fault_cb, &ctx, 1, 0));
+    OK(uc_emu_start(uc, PROT_CODE_ADDR,
+                    PROT_CODE_ADDR + sizeof(prot_write_code) - 1, 0, 0));
+    TEST_CHECK(ctx.count == 1);
+    TEST_CHECK(ctx.address == PROT_DATA_ADDR);
+
+    OK(uc_mem_read(uc, PROT_DATA_ADDR, &value, sizeof(value)));
+    TEST_CHECK(value == 0x12345678);
+
+    OK(uc_close(uc));
+}
+
+// A page that a UC_HOOK_MEM_READ callback unmaps goes to the
+// UC_HOOK_MEM_READ_UNMAPPED hooks, which can map it again.
+static void test_mem_read_hook_unmap(void)
+{
+    uc_engine *uc;
+    uc_hook hook1, hook2;
+    mem_prot_hook_ctx ctx = {0};
+    uint32_t eax = 0;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, PROT_CODE_ADDR, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc, PROT_DATA_ADDR, 0x1000, UC_PROT_READ | UC_PROT_WRITE));
+    OK(uc_mem_write(uc, PROT_CODE_ADDR, prot_read_code,
+                    sizeof(prot_read_code) - 1));
+    OK(uc_hook_add(uc, &hook1, UC_HOOK_MEM_READ, test_mem_access_unmap_cb,
+                   NULL, 1, 0));
+    OK(uc_hook_add(uc, &hook2, UC_HOOK_MEM_READ_UNMAPPED,
+                   test_mem_map_on_fault_cb, &ctx, 1, 0));
+    OK(uc_emu_start(uc, PROT_CODE_ADDR,
+                    PROT_CODE_ADDR + sizeof(prot_read_code) - 1, 0, 0));
+    TEST_CHECK(ctx.count == 1);
+    TEST_CHECK(ctx.address == PROT_DATA_ADDR);
+
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0x12345678);
+
+    OK(uc_close(uc));
+}
+
+// A UC_HOOK_MEM_READ callback that makes a whole one-page region unreadable
+// stops the load. This change neither splits the region nor toggles write
+// access, so it does not flush the TLB.
+static void test_mem_read_hook_revoke_no_flush(void)
+{
+    uc_engine *uc;
+    uc_hook hook;
+    mem_prot_hook_ctx ctx = {0};
+    uint32_t eax = 0;
+
+    ctx.new_perms = UC_PROT_NONE;
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, PROT_CODE_ADDR, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc, PROT_DATA_ADDR, 0x1000, UC_PROT_READ));
+    OK(uc_mem_write(uc, PROT_CODE_ADDR, prot_read_code,
+                    sizeof(prot_read_code) - 1));
+    OK(uc_mem_write(uc, PROT_DATA_ADDR, prot_data, sizeof(prot_data) - 1));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ, test_mem_access_protect_cb,
+                   &ctx, 1, 0));
+    uc_assert_err(UC_ERR_READ_PROT,
+                  uc_emu_start(uc, PROT_CODE_ADDR,
+                               PROT_CODE_ADDR + sizeof(prot_read_code) - 1, 0,
+                               0));
+    TEST_CHECK(ctx.count == 1);
+
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0);
+
+    OK(uc_close(uc));
+}
+
 TEST_LIST = {{"test_map_correct", test_map_correct},
              {"test_map_wrapping", test_map_wrapping},
              {"test_mem_protect", test_mem_protect},
@@ -1380,4 +1653,16 @@ TEST_LIST = {{"test_map_correct", test_map_correct},
               test_mem_write_prot_hook_smc_no_exec},
              {"test_mem_write_prot_hook_unaligned_smc",
               test_mem_write_prot_hook_unaligned_smc},
+             {"test_mem_write_prot_hook_map_ptr",
+              test_mem_write_prot_hook_map_ptr},
+             {"test_mem_write_cross_page_unmapped",
+              test_mem_write_cross_page_unmapped},
+             {"test_mem_write_unmapped_hook_cross_page",
+              test_mem_write_unmapped_hook_cross_page},
+             {"test_mem_read_unmapped_hook_cross_page",
+              test_mem_read_unmapped_hook_cross_page},
+             {"test_mem_write_hook_unmap", test_mem_write_hook_unmap},
+             {"test_mem_read_hook_unmap", test_mem_read_hook_unmap},
+             {"test_mem_read_hook_revoke_no_flush",
+              test_mem_read_hook_revoke_no_flush},
              {NULL, NULL}};

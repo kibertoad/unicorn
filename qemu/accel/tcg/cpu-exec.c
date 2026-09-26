@@ -588,11 +588,6 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
 #endif /* buggy compiler */
 
         assert_no_pages_locked();
-
-        // Unicorn: a split memory access that longjmp'd out of one of its
-        // pieces never restored its state, so drop it here
-        uc->size_recur_mem = 0;
-        uc->size_recur_prot_page = UC_NO_PROT_PAGE;
     }
 
     /* if an exception is pending, we execute it here */

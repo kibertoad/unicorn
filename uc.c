@@ -1091,17 +1091,11 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
                     uint64_t timeout, size_t count)
 {
     uc_err err;
-    // A nested call may come from a hook that runs in the middle of a split
-    // memory access, which needs its state back once this call returns
-    int old_size_recur_mem = uc->size_recur_mem;
-    uint64_t old_size_recur_prot_page = uc->size_recur_prot_page;
 
     // reset the counter
     uc->emu_counter = 0;
     uc->invalid_error = UC_ERR_OK;
     uc->emulation_done = false;
-    uc->size_recur_mem = 0;
-    uc->size_recur_prot_page = UC_NO_PROT_PAGE;
     uc->timed_out = false;
     uc->first_tb = true;
 
@@ -1114,8 +1108,6 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
     // we return from uc_emu_start.
     if (uc->nested_level >= UC_MAX_NESTED_LEVEL) {
         // We can't support so many nested levels.
-        uc->size_recur_mem = old_size_recur_mem;
-        uc->size_recur_prot_page = old_size_recur_prot_page;
         return UC_ERR_RESOURCE;
     }
     uc->nested_level++;
@@ -1232,8 +1224,6 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
         uc->hook_insert = 0;
         if (err != UC_ERR_OK) {
             uc->nested_level--;
-            uc->size_recur_mem = old_size_recur_mem;
-            uc->size_recur_prot_page = old_size_recur_prot_page;
             return err;
         }
     }
@@ -1251,8 +1241,6 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
     uc->vm_start(uc);
 
     uc->nested_level--;
-    uc->size_recur_mem = old_size_recur_mem;
-    uc->size_recur_prot_page = old_size_recur_prot_page;
 
     // emulation is done if and only if we exit the outer uc_emu_start
     // or we may lost uc_emu_stop
